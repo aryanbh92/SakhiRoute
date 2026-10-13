@@ -1,0 +1,471 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function identityVerified(userId) {
+      return exists(/databases/$(database)/documents/verifiedUsers/$(userId));
+    }
+
+    function hasActiveNearbyPresence(userId) {
+      let presencePath =
+        /databases/$(database)/documents/nearbyPresence/$(userId);
+      return exists(presencePath)
+        && get(presencePath).data.expiresAt is timestamp
+        && get(presencePath).data.expiresAt > request.time
+        && get(presencePath).data.updatedAt is timestamp
+        && get(presencePath).data.updatedAt
+          > request.time - duration.value(1, 'm');
+    }
+
+    function chatDocument(chatId) {
+      return /databases/$(database)/documents/chats/$(chatId);
+    }
+
+    function isChatMember(chatId) {
+      return signedIn()
+        && exists(chatDocument(chatId))
+        && request.auth.uid in get(chatDocument(chatId)).data.members;
+    }
+
+    function bothChatMembersConsented(chatId) {
+      let members = get(chatDocument(chatId)).data.members;
+      return members.size() == 2
+        && get(chatDocument(chatId)).data.status == 'active'
+        && get(chatDocument(chatId)).data.expiresAt is timestamp
+        && get(chatDocument(chatId)).data.expiresAt > request.time
+        && exists(/databases/$(database)/documents/chats/$(chatId)/consents/$(members[0]))
+        && exists(/databases/$(database)/documents/chats/$(chatId)/consents/$(members[1]));
+    }
+
+    match /verifiedUsers/{userId} {
+      allow read: if isSelf(userId);
+      allow write: if false;
+    }
+
+    match /users/{userId} {
+      allow read, create, update: if isSelf(userId);
+      allow delete: if false;
+    }
+
+    match /nearbyPresence/{userId} {
+      allow read: if isSelf(userId);
+      allow create, update: if isSelf(userId)
+        && identityVerified(userId)
+        && request.resource.data.keys().hasOnly([
+          'geohash',
+          'latitude',
+          'longitude',
+          'updatedAt',
+          'expiresAt'
+        ])
+        && request.resource.data.geohash is string
+        && request.resource.data.geohash.size() >= 1
+        && request.resource.data.geohash.size() <= 12
+        && request.resource.data.latitude is number
+        && request.resource.data.latitude >= -90
+        && request.resource.data.latitude <= 90
+        && request.resource.data.longitude is number
+        && request.resource.data.longitude >= -180
+        && request.resource.data.longitude <= 180
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(1, 'm');
+      allow delete: if isSelf(userId);
+    }
+
+    match /contacts/{contactId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid;
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /journeys/{journeyId} {
+      allow read: if signedIn()
+        && (resource.data.userId == request.auth.uid || resource.data.share == true);
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if signedIn()
+        && resource.data.userId == request.auth.uid;
+    }
+
+    match /requests/{requestId} {
+      allow read: if signedIn()
+        && (resource.data.fromUser == request.auth.uid
+          || resource.data.toUser == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.fromUser == request.auth.uid
+        && identityVerified(request.auth.uid)
+        && hasActiveNearbyPresence(request.auth.uid)
+        && request.resource.data.toUser is string
+        && request.resource.data.toUser != request.auth.uid
+        && identityVerified(request.resource.data.toUser)
+        && hasActiveNearbyPresence(request.resource.data.toUser)
+        && request.resource.data.keys().hasOnly([
+          'fromUser',
+          'toUser',
+          'fromName',
+          'toName',
+          'distanceM',
+          'direction',
+          'status',
+          'createdAt',
+          'expiresAt'
+        ])
+        && request.resource.data.fromName is string
+        && request.resource.data.fromName.size() > 0
+        && request.resource.data.fromName.size() <= 60
+        && request.resource.data.toName is string
+        && request.resource.data.toName.size() > 0
+        && request.resource.data.toName.size() <= 60
+        && request.resource.data.distanceM is number
+        && request.resource.data.distanceM >= 1
+        && request.resource.data.distanceM <= 30
+        && request.resource.data.direction in [
+          'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'
+        ]
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt
+          <= request.time + duration.value(24, 'h');
+      allow update, delete: if false;
+    }
+
+    match /chats/{chatId} {
+      allow read: if isChatMember(chatId);
+      allow create: if false;
+      allow update: if isChatMember(chatId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status == 'ended';
+      allow delete: if false;
+
+      match /consents/{userId} {
+        allow read: if isChatMember(chatId);
+        allow create: if isChatMember(chatId)
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly([
+            'accepted',
+            'policyVersion',
+            'acceptedAt',
+            'deleteAt'
+          ])
+          && request.resource.data.accepted == true
+          && request.resource.data.policyVersion == 'chat-evidence-1'
+          && request.resource.data.acceptedAt == request.time
+          && request.resource.data.deleteAt is timestamp
+          && request.resource.data.deleteAt
+            == get(chatDocument(chatId)).data.deleteAt;
+        allow update, delete: if false;
+      }
+
+      match /routeShares/{userId} {
+        allow read: if isChatMember(chatId);
+        allow create, update: if isChatMember(chatId)
+          && bothChatMembersConsented(chatId)
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly([
+            'destination',
+            'updatedAt',
+            'deleteAt'
+          ])
+          && request.resource.data.destination is string
+          && request.resource.data.destination.size() >= 2
+          && request.resource.data.destination.size() <= 120
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.deleteAt is timestamp
+          && request.resource.data.deleteAt
+            == get(chatDocument(chatId)).data.deleteAt;
+        allow delete: if isChatMember(chatId) && request.auth.uid == userId;
+      }
+
+      match /liveLocations/{userId} {
+        allow read: if isChatMember(chatId)
+          && resource.data.expiresAt is timestamp
+          && resource.data.expiresAt > request.time;
+        allow create, update: if isChatMember(chatId)
+          && bothChatMembersConsented(chatId)
+          && request.auth.uid == userId
+          && request.resource.data.keys().hasOnly([
+            'latitude',
+            'longitude',
+            'mapLink',
+            'updatedAt',
+            'expiresAt'
+          ])
+          && request.resource.data.latitude is number
+          && request.resource.data.latitude >= -90
+          && request.resource.data.latitude <= 90
+          && request.resource.data.longitude is number
+          && request.resource.data.longitude >= -180
+          && request.resource.data.longitude <= 180
+          && request.resource.data.mapLink is string
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.expiresAt is timestamp
+          && request.resource.data.expiresAt > request.time
+          && request.resource.data.expiresAt
+            <= request.time + duration.value(1, 'm');
+        allow delete: if isChatMember(chatId) && request.auth.uid == userId;
+      }
+
+      match /messages/{messageId} {
+        allow read: if isChatMember(chatId);
+        allow create: if isChatMember(chatId)
+          && bothChatMembersConsented(chatId)
+          && get(/databases/$(database)/documents/chats/$(chatId)).data.status == 'active'
+          && request.resource.data.keys().hasOnly([
+            'senderId',
+            'text',
+            'imageUrl',
+            'imagePath',
+            'archivePath',
+            'createdAt',
+            'deleteAt',
+            'removedAt'
+          ])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.deleteAt is timestamp
+          && (
+            (request.resource.data.keys().hasAny(['text'])
+              && request.resource.data.text is string
+              && request.resource.data.text.size() > 0
+              && request.resource.data.text.size() <= 1500)
+            || (request.resource.data.keys().hasAny([
+                'imageUrl',
+                'imagePath',
+                'archivePath'
+              ])
+              && request.resource.data.imageUrl is string
+              && request.resource.data.imagePath is string
+              && request.resource.data.archivePath is string
+              && request.resource.data.imagePath
+                == 'chat-media/' + chatId + '/' + request.auth.uid + '/' + messageId
+              && request.resource.data.archivePath
+                == 'chat-evidence/' + chatId + '/' + request.auth.uid + '/' + messageId)
+          );
+        allow update: if isChatMember(chatId)
+          && resource.data.senderId == request.auth.uid
+          && !resource.data.keys().hasAny(['removedAt'])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['removedAt'])
+          && request.resource.data.removedAt == request.time;
+        allow delete: if false;
+      }
+
+    }
+
+    match /chatEvidence/{evidenceId} {
+      allow read, update, delete: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'chatId',
+          'senderId',
+          'storagePath',
+          'chatMediaPath',
+          'createdAt',
+          'expiresAt'
+        ])
+        && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt
+          <= request.time + duration.value(8, 'd')
+        && request.resource.data.storagePath is string
+        && request.resource.data.chatMediaPath is string
+        && request.resource.data.storagePath
+          == 'chat-evidence/' + request.resource.data.chatId + '/'
+            + request.auth.uid + '/' + evidenceId
+        && request.resource.data.chatMediaPath
+          == 'chat-media/' + request.resource.data.chatId + '/'
+            + request.auth.uid + '/' + evidenceId
+        && isChatMember(request.resource.data.chatId)
+        && bothChatMembersConsented(request.resource.data.chatId);
+    }
+
+    match /sos/{alertId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /sosAlerts/{alertId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /sosLiveSessions/{sessionId} {
+      allow read: if signedIn()
+        && (resource.data.ownerUid == request.auth.uid
+          || (resource.data.viewerUids is list
+            && request.auth.uid in resource.data.viewerUids));
+      allow write: if false;
+    }
+
+    match /verificationRequests/{userId} {
+      allow read: if isSelf(userId);
+      allow create, update: if isSelf(userId)
+        && request.resource.data.status == 'pending';
+      allow delete: if false;
+    }
+
+    match /reports/{reportId} {
+      allow create: if false;
+      allow read, update, delete: if false;
+    }
+
+    match /webUsers/{userId} {
+      allow read: if isSelf(userId);
+      allow create: if isSelf(userId)
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'fullName',
+          'email',
+          'mobileNumber',
+          'role',
+          'identityStatus',
+          'policeStatus',
+          'accountStatus',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.keys().hasAll([
+          'uid',
+          'fullName',
+          'email',
+          'mobileNumber',
+          'role',
+          'identityStatus',
+          'policeStatus',
+          'accountStatus',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 80
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.mobileNumber is string
+        && request.resource.data.mobileNumber.size() >= 10
+        && request.resource.data.mobileNumber.size() <= 18
+        && request.resource.data.role == 'user'
+        && request.resource.data.identityStatus == 'not_started'
+        && request.resource.data.policeStatus == 'not_requested'
+        && request.resource.data.accountStatus == 'active'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if isSelf(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'fullName',
+          'mobileNumber',
+          'preferences',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.identityStatus == resource.data.identityStatus
+        && request.resource.data.policeStatus == resource.data.policeStatus
+        && request.resource.data.accountStatus == resource.data.accountStatus
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 80
+        && request.resource.data.mobileNumber is string
+        && request.resource.data.mobileNumber.size() >= 10
+        && request.resource.data.mobileNumber.size() <= 18
+        && (!request.resource.data.keys().hasAny(['preferences'])
+          || (request.resource.data.preferences is map
+            && request.resource.data.preferences.keys().hasOnly([
+              'shareTrips',
+              'emailUpdates'
+            ])
+            && request.resource.data.preferences.shareTrips is bool
+            && request.resource.data.preferences.emailUpdates is bool));
+      allow delete: if false;
+    }
+
+    match /webRoutes/{routeId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'userId',
+          'origin',
+          'destination',
+          'travelMode',
+          'createdAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.origin is string
+        && request.resource.data.origin.size() >= 2
+        && request.resource.data.origin.size() <= 160
+        && request.resource.data.destination is string
+        && request.resource.data.destination.size() >= 2
+        && request.resource.data.destination.size() <= 160
+        && request.resource.data.travelMode in ['walking', 'driving', 'transit']
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /webEmergencyContacts/{contactId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'userId',
+          'name',
+          'phone',
+          'createdAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() >= 7
+        && request.resource.data.phone.size() <= 20
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /webNotifications/{notificationId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if false;
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read == true;
+      allow delete: if false;
+    }
+
+    match /webVerificationRequests/{requestId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create, update, delete: if false;
+    }
+
+    match /webVerificationAudit/{auditId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

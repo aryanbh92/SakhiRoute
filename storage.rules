@@ -1,0 +1,47 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function chat(chatId) {
+      return firestore.get(/databases/(default)/documents/chats/$(chatId));
+    }
+
+    function isChatMember(chatId) {
+      return request.auth != null
+        && request.auth.uid in chat(chatId).data.members;
+    }
+
+    function bothMembersConsented(chatId) {
+      let members = chat(chatId).data.members;
+      return firestore.exists(
+          /databases/(default)/documents/chats/$(chatId)/consents/$(members[0])
+        )
+        && firestore.exists(
+          /databases/(default)/documents/chats/$(chatId)/consents/$(members[1])
+        )
+        && chat(chatId).data.status == 'active'
+        && chat(chatId).data.expiresAt > request.time;
+    }
+
+    match /chat-media/{chatId}/{userId}/{fileName} {
+      allow read: if isChatMember(chatId);
+      allow create: if isChatMember(chatId)
+        && request.auth.uid == userId
+        && bothMembersConsented(chatId)
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp|heic|heif)');
+      allow update: if false;
+      allow delete: if isChatMember(chatId) && request.auth.uid == userId;
+    }
+
+    match /chat-evidence/{chatId}/{userId}/{fileName} {
+      allow read: if request.auth != null && request.auth.token.admin == true;
+      allow create: if isChatMember(chatId)
+        && request.auth.uid == userId
+        && bothMembersConsented(chatId)
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp|heic|heif)')
+        && resource == null;
+      allow update, delete: if false;
+    }
+  }
+}
